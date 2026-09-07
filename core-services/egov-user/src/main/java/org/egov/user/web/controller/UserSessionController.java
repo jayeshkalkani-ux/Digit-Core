@@ -35,8 +35,10 @@ public class UserSessionController {
 
     @PostMapping("/user-session/v1/_revoke")
     public ResponseEntity<Map<String, Object>> revoke(@Valid @RequestBody RevokeSessionRequest request) {
-        log.info("Session revoke requested for user: {} tenant: {}", request.getUserUuid(), request.getTenantId());
-        userSessionService.revoke(request.getUserUuid(), request.getTenantId());
+        String actor = request.getRequestInfo() != null && request.getRequestInfo().getUserInfo() != null
+                ? request.getRequestInfo().getUserInfo().getUuid() : "UNKNOWN_ADMIN";
+        log.info("Session revoke requested for user: {} tenant: {} by {}", request.getUserUuid(), request.getTenantId(), actor);
+        userSessionService.revoke(request.getUserUuid(), request.getTenantId(), actor);
 
         ResponseInfo responseInfo = responseInfoFactory.createResponseInfoFromRequestInfo(request.getRequestInfo(), true);
         Map<String, Object> response = new HashMap<>();

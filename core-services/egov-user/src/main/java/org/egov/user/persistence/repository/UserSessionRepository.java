@@ -42,6 +42,7 @@ public class UserSessionRepository {
         params.put("status", session.getStatus());
         params.put("createdtime", session.getCreatedTime());
         params.put("lastservercontact", session.getLastServerContact());
+        params.put("version", session.getVersion());
 
         String query = databaseSchemaUtils.replaceSchemaPlaceholder(
                 UserSessionQueryBuilder.INSERT_ACTIVE_SESSION_SQL, session.getTenantId());
@@ -67,13 +68,19 @@ public class UserSessionRepository {
         return results.stream().findFirst();
     }
 
-    public void updateStatus(String sessionId, String tenantId, String newStatus) {
+    /**
+     * Only transitions a row that is currently ACTIVE. Returns the number of rows updated
+     * (0 or 1) so callers can tell a genuine transition apart from a no-op retry of an
+     * already-terminated session — see UserSessionService.logout/revoke, which only log and
+     * audit when this actually changed something.
+     */
+    public int updateStatus(String sessionId, String tenantId, String newStatus) {
         Map<String, Object> params = new HashMap<>();
         params.put("sessionid", sessionId);
         params.put("status", newStatus);
         String query = databaseSchemaUtils.replaceSchemaPlaceholder(
                 UserSessionQueryBuilder.UPDATE_SESSION_STATUS_SQL, tenantId);
-        namedParameterJdbcTemplate.update(query, params);
+        return namedParameterJdbcTemplate.update(query, params);
     }
 
     /**
@@ -89,5 +96,39 @@ public class UserSessionRepository {
         String query = databaseSchemaUtils.replaceSchemaPlaceholder(
                 UserSessionQueryBuilder.TOUCH_LAST_SERVER_CONTACT_SQL, tenantId);
         namedParameterJdbcTemplate.update(query, params);
+    }
+
+    /**
+     * Re-login on the same device: rotates the ACTIVE row's sessionId in place. Returns the
+     * number of rows updated (0 or 1) so the caller can tell a same-device re-auth apart from
+     * a genuine different-device conflict without a separate read.
+     */
+    public int reactivateSessionForDevice(String userUuid, String tenantId, String deviceId,
+                                           String newSessionId, long now) {
+        Map<String, Object> params = new HashMap<>();
+        params.put("useruuid", userUuid);
+        params.put("tenantid", tenantId);
+        params.put("deviceid", deviceId);
+        params.put("newsessionid", newSessionId);
+        params.put("now", now);
+        String query = databaseSchemaUtils.replaceSchemaPlaceholder(
+                UserSessionQueryBuilder.REACTIVATE_SESSION_FOR_DEVICE_SQL, tenantId);
+        return namedParameterJdbcTemplate.update(query, params);
+    }
+
+    /**
+     * Transitions a session to EXPIRED if it is still ACTIVE, has gone stale beyond
+     * {@code cutoff}, and is still at {@code expectedVersion} — the optimistic-concurrency
+     * guard against the row having been mutated since the caller read it. Returns the number
+     * of rows updated (0 or 1) so the caller can tell whether the expiry actually took effect.
+     */
+    public int expireStaleSession(String sessionId, String tenantId, long cutoff, int expectedVersion) {
+        Map<String, Object> params = new HashMap<>();
+        params.put("sessionid", sessionId);
+        params.put("cutoff", cutoff);
+        params.put("expectedversion", expectedVersion);
+        String query = databaseSchemaUtils.replaceSchemaPlaceholder(
+                UserSessionQueryBuilder.EXPIRE_STALE_SESSION_SQL, tenantId);
+        return namedParameterJdbcTemplate.update(query, params);
     }
 }
