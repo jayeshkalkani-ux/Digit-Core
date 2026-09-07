@@ -1,0 +1,1 @@
+ALTER TABLE eg_user_session ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 0;
