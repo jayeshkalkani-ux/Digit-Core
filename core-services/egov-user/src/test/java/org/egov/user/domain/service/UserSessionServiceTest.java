@@ -392,6 +392,132 @@ public class UserSessionServiceTest {
     public void test_revoke_should_fail_when_no_active_session_exists() {
         when(userSessionRepository.findActiveSession(USER_UUID, TENANT_ID)).thenReturn(Optional.empty());
 
-        userSessionService.revoke(USER_UUID, TENANT_ID);
+        userSessionService.revoke(USER_UUID, TENANT_ID, "admin-uuid-1");
+    }
+
+    // Optimistic concurrency: something else (logout, expiry) terminated this exact session
+    // between the read and the write — the update loses the race and revoke fails cleanly
+    // rather than reporting success for a revoke that didn't actually happen.
+    @Test(expected = CustomException.class)
+    public void test_revoke_should_fail_when_update_loses_race() {
+        UserSession active = new UserSession(USER_UUID, TENANT_ID, "device-A", "session-1",
+                "ACTIVE", System.currentTimeMillis(), System.currentTimeMillis());
+        when(userSessionRepository.findActiveSession(USER_UUID, TENANT_ID)).thenReturn(Optional.of(active));
+        when(userSessionRepository.updateStatus("session-1", TENANT_ID, "REVOKED")).thenReturn(0);
+
+        try {
+            userSessionService.revoke(USER_UUID, TENANT_ID, "admin-uuid-1");
+        } finally {
+            verify(userSessionAuditRepository, never()).insert(any(UserSessionAudit.class));
+        }
+    }
+
+    // Audit: a fresh login with no conflict is recorded as LOGIN_SUCCESS, self-attributed.
+    @Test
+    public void test_should_audit_login_success() {
+        userSessionService.createSession(USER_UUID, TENANT_ID, "device-A", "mobile");
+
+        UserSessionAudit audit = captureAudit();
+        assertEquals("LOGIN_SUCCESS", audit.getAction());
+        assertEquals(USER_UUID, audit.getActor());
+        assertEquals("device-A", audit.getDeviceId());
+    }
+
+    // Audit: a rejected login on a genuinely conflicting device is recorded as LOGIN_REJECTED.
+    @Test
+    public void test_should_audit_login_rejected() {
+        doThrow(new DuplicateKeyException("duplicate active session"))
+                .when(userSessionRepository).insertActiveSession(any(UserSession.class));
+        UserSession fresh = new UserSession(USER_UUID, TENANT_ID, "device-A", "session-1",
+                "ACTIVE", System.currentTimeMillis(), System.currentTimeMillis());
+        when(userSessionRepository.findActiveSession(USER_UUID, TENANT_ID)).thenReturn(Optional.of(fresh));
+
+        try {
+            userSessionService.createSession(USER_UUID, TENANT_ID, "device-B", "mobile");
+        } catch (OAuth2Exception ignored) {
+            // expected — asserting the audit trail, not the exception itself
+        }
+
+        UserSessionAudit audit = captureAudit();
+        assertEquals("LOGIN_REJECTED", audit.getAction());
+        assertEquals(USER_UUID, audit.getActor());
+        assertEquals("device-B", audit.getDeviceId());
+    }
+
+    // Audit: same-device re-login is recorded as LOGIN_REACTIVATED, not a fresh LOGIN_SUCCESS.
+    @Test
+    public void test_should_audit_login_reactivated() {
+        doThrow(new DuplicateKeyException("duplicate active session"))
+                .when(userSessionRepository).insertActiveSession(any(UserSession.class));
+        when(userSessionRepository.reactivateSessionForDevice(eq(USER_UUID), eq(TENANT_ID), eq("device-A"), anyString(), anyLong()))
+                .thenReturn(1);
+
+        userSessionService.createSession(USER_UUID, TENANT_ID, "device-A", "mobile");
+
+        UserSessionAudit audit = captureAudit();
+        assertEquals("LOGIN_REACTIVATED", audit.getAction());
+        assertEquals(USER_UUID, audit.getActor());
+    }
+
+    // Audit: expiring a stale blocker on login collision writes a system-attributed EXPIRED
+    // entry for the old session, followed by a self-attributed LOGIN_SUCCESS for the new one.
+    @Test
+    public void test_should_audit_expired_and_login_success_when_stale_session_is_expired_on_conflict() {
+        doThrow(new DuplicateKeyException("duplicate active session"))
+                .doNothing()
+                .when(userSessionRepository).insertActiveSession(any(UserSession.class));
+        long staleContact = System.currentTimeMillis() - THIRTY_DAYS_MILLIS;
+        UserSession stale = new UserSession(USER_UUID, TENANT_ID, "device-A", "old-session",
+                "ACTIVE", staleContact, staleContact);
+        when(userSessionRepository.findActiveSession(USER_UUID, TENANT_ID)).thenReturn(Optional.of(stale));
+        when(userSessionRepository.expireStaleSession(eq("old-session"), eq(TENANT_ID), anyLong(), anyInt())).thenReturn(1);
+
+        userSessionService.createSession(USER_UUID, TENANT_ID, "device-B", "mobile");
+
+        ArgumentCaptor<UserSessionAudit> captor = ArgumentCaptor.forClass(UserSessionAudit.class);
+        verify(userSessionAuditRepository, times(2)).insert(captor.capture());
+        UserSessionAudit expiredAudit = captor.getAllValues().get(0);
+        assertEquals("EXPIRED", expiredAudit.getAction());
+        assertEquals("SYSTEM", expiredAudit.getActor());
+        assertEquals("old-session", expiredAudit.getSessionId());
+        UserSessionAudit loginAudit = captor.getAllValues().get(1);
+        assertEquals("LOGIN_SUCCESS", loginAudit.getAction());
+        assertEquals(USER_UUID, loginAudit.getActor());
+    }
+
+    // Audit: the owning device reconnecting after the inactivity window writes a
+    // system-attributed EXPIRED entry.
+    @Test(expected = CustomException.class)
+    public void test_should_audit_expired_on_owning_device_reconnect_after_inactivity() {
+        long staleContact = System.currentTimeMillis() - THIRTY_DAYS_MILLIS;
+        UserSession stale = new UserSession(USER_UUID, TENANT_ID, "device-A", "session-1",
+                "ACTIVE", staleContact, staleContact);
+        when(userSessionRepository.findBySessionId("session-1", TENANT_ID)).thenReturn(Optional.of(stale));
+
+        try {
+            userSessionService.validateAndTouch("session-1", TENANT_ID);
+        } finally {
+            UserSessionAudit audit = captureAudit();
+            assertEquals("EXPIRED", audit.getAction());
+            assertEquals("SYSTEM", audit.getActor());
+            assertEquals(USER_UUID, audit.getUserUuid());
+        }
+    }
+
+    // A best-effort audit write failure must never break the operation it is auditing.
+    @Test
+    public void test_should_not_propagate_audit_write_failure() {
+        org.mockito.Mockito.doThrow(new RuntimeException("db down"))
+                .when(userSessionAuditRepository).insert(any(UserSessionAudit.class));
+
+        String sessionId = userSessionService.createSession(USER_UUID, TENANT_ID, "device-A", "mobile");
+
+        assertNotNull(sessionId);
+    }
+
+    private UserSessionAudit captureAudit() {
+        ArgumentCaptor<UserSessionAudit> captor = ArgumentCaptor.forClass(UserSessionAudit.class);
+        verify(userSessionAuditRepository).insert(captor.capture());
+        return captor.getValue();
     }
 }
